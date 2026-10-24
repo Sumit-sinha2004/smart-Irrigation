@@ -12,6 +12,8 @@ from simulate import SOILS
 st.set_page_config(page_title="Smart Irrigation Planner", layout="wide")
 
 LAT, LON = 28.47, 77.50  # Greater Noida
+AI = "AI (model + rules)"
+METHODS = [AI, "Fixed every 10d x 50mm", "Fixed every 15d x 60mm", "Fixed every 21d x 60mm"]
 
 
 def kc_from_day(day):
@@ -43,23 +45,8 @@ def get_forecast():
 
 
 @st.cache_data
-def load_dataset():
-    df = pd.read_csv("data/dataset.csv")
-    df["time"] = pd.to_datetime(df["time"])
-    df["season"] = df["time"].apply(lambda d: d.year if d.month >= 11 else d.year - 1)
-    return df
-
-
-def fixed_schedule(season, soil, interval, depth):
-    fc, wp = SOILS[soil]["fc"], SOILS[soil]["wp"]
-    moisture, applied, events = fc, 0.0, 0
-    for i, (_, r) in enumerate(season.iterrows()):
-        irr = depth if (i + 1) % interval == 0 else 0
-        moisture += r["precipitation_sum"] - r["et0_fao_evapotranspiration"] * r["kc"] + irr
-        moisture = max(wp, min(fc, moisture))
-        applied += irr
-        events += 1 if irr else 0
-    return applied, events
+def load_eval():
+    return pd.read_csv("data/evaluation.csv")
 
 
 model = load_model()
@@ -73,7 +60,7 @@ with st.sidebar:
     day = st.slider("Days since sowing", 0, 140, 60)
     depletion = st.slider("Yesterday's soil dryness (0 = full, 1 = dry)", 0.0, 1.0, 0.3, 0.05)
 
-tab1, tab2 = st.tabs(["Today's recommendation", "Water saved vs fixed schedule"])
+tab1, tab2 = st.tabs(["Today's recommendation", "AI vs fixed schedules"])
 
 with tab1:
     try:
@@ -107,27 +94,38 @@ with tab1:
     c4.metric("ET0 today (mm)", f"{w['et0']:.1f}")
 
     st.subheader("Weather used (3 past days, today, 2 forecast days)")
-    st.dataframe(fc_df, use_container_width=True)
+    st.dataframe(fc_df, width="stretch")
 
 with tab2:
-    data = load_dataset()
-    c1, c2, c3 = st.columns(3)
-    season_year = c1.selectbox("Season (sowing year)", sorted(data["season"].unique()))
-    interval = c2.slider("Fixed schedule: irrigate every N days", 5, 20, 10)
-    depth = c3.slider("Fixed schedule: water per irrigation (mm)", 20, 100, 50)
+    ev = load_eval()
+    split = st.radio("Seasons used", ["test", "train"], horizontal=True,
+                     help="test = seasons the model never saw in training (2024 season "
+                          "and Nov-Dec 2025). train = earlier seasons.")
+    sub = ev[(ev["split"] == split) & (ev["soil"] == soil)]
+    tot = sub.groupby("method")[["water_mm", "excess_mm", "irrigations", "stress_days"]].sum()
+    tot = tot.reindex(METHODS)
 
-    season = data[(data["season"] == season_year) & (data["soil"] == soil)].sort_values("time")
-    ai_water = season["water_mm"].sum()
-    ai_events = int(season["irrigate"].sum())
-    fx_water, fx_events = fixed_schedule(season, soil, interval, depth)
+    baseline = st.selectbox("Compare the AI against", METHODS[1:], index=2)
+    ai, fx = tot.loc[AI], tot.loc[baseline]
+    saved = (fx["water_mm"] - ai["water_mm"]) / fx["water_mm"] * 100
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("AI-based water (mm)", f"{ai_water:.0f}", f"{ai_events} irrigations")
-    m2.metric("Fixed-schedule water (mm)", f"{fx_water:.0f}", f"{fx_events} irrigations")
-    saved = (fx_water - ai_water) / fx_water * 100 if fx_water else 0
-    m3.metric("Water saved", f"{saved:.0f}%")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("AI water (mm)", f"{ai['water_mm']:.0f}", f"{ai['irrigations']:.0f} irrigations",
+              delta_color="off")
+    m2.metric("Fixed-schedule water (mm)", f"{fx['water_mm']:.0f}",
+              f"{fx['irrigations']:.0f} irrigations", delta_color="off")
+    m3.metric("Water saved by AI", f"{saved:.0f}%")
+    m4.metric("Stress days: AI vs fixed",
+              f"{ai['stress_days']:.0f} vs {fx['stress_days']:.0f}")
 
-    st.bar_chart(pd.DataFrame({"Water (mm)": [ai_water, fx_water]},
-                              index=["AI-based", "Fixed schedule"]))
-    st.caption("A fixed schedule that applies too little water would also look efficient, "
-               "so crop stress days will be added in the testing step.")
+    st.subheader(f"Water applied (mm), {soil} soil, {split} seasons")
+    st.bar_chart(tot["water_mm"])
+
+    st.subheader("Full comparison")
+    st.dataframe(tot.rename(columns={
+        "water_mm": "Water (mm)", "excess_mm": "Excess above field capacity (mm)",
+        "irrigations": "Irrigations", "stress_days": "Crop stress days"}), width="stretch")
+
+    st.caption("Simulation-based validation: stress days are days when more than 50% of the "
+               "available soil water is used up. Fixed schedules are baselines chosen for "
+               "comparison, not real farm practice.")
